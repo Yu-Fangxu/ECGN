@@ -2,6 +2,9 @@
 
 In this paper, we introduce the Emotional Contagion Graph Network (ECGN), a novel model designed to improve causal emotion entailment in conversations by simulating both explicit (verbal) and implicit (non-verbal) emotional influences. 
 
+More details can be found in our paper:
+Fangxu Yu, Junjie Guo, Zhen Wu, Xinyu Dai, "[Beyond Verbal Cues: Emotional Contagion Graph Network for Causal Emotion Entailment](https://arxiv.org/abs/2403.20289)" 
+
 ## ECGN
 
 ![plot](./assets/main_arch.png)
