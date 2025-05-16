@@ -90,12 +90,7 @@ def get_paramsgroup(model, warmup=False):
     params = sorted(params, key=lambda x: x['lr'])
     return params
 
-def get_DailyDialog_loaders(batch_size=8, num_workers=0, pin_memory=False):
-    # trainset = DailyDialogRobertaCometDataset('train')
-    # validset = DailyDialogRobertaCometDataset('valid')
-    # testset = DailyDialogRobertaCometDataset('test')
-    bert_path = "FacebookAI/roberta-base"
-    tokenizer = AutoTokenizer.from_pretrained(bert_path)
+def get_DailyDialog_loaders(tokenizer, batch_size=8, num_workers=0, pin_memory=False):
     trainset = DailyDialogRobertaDataset('train', tokenizer)
     validset = DailyDialogRobertaDataset('valid', tokenizer)
     testset = DailyDialogRobertaDataset('test', tokenizer)
@@ -106,112 +101,107 @@ def get_DailyDialog_loaders(batch_size=8, num_workers=0, pin_memory=False):
                               shuffle=True, collate_fn=collate_fn)
 
     valid_loader = DataLoader(validset,
-                              batch_size=batch_size,
+                              batch_size=1,
                               num_workers=num_workers,
                               pin_memory=pin_memory, collate_fn=collate_fn)
 
     test_loader = DataLoader(testset,
-                             batch_size=batch_size,
+                             batch_size=1,
                              num_workers=num_workers,
                              pin_memory=pin_memory, collate_fn=collate_fn)
 
     return train_loader, valid_loader, test_loader
 
-def train_or_eval_model(model, loss_function, dataloader, epoch, device, optimizer=None, train=False):
+def train_or_eval_model(model, loss_function, dataloader, epoch, device, bert_path, optimizer=None, mode="train"):
+    label_index_mapping = {'hap':0, 'sad':1, 'neu':2, 'ang':3, 'exc':4, 'fru':5}
     losses, preds, labels, masks, losses_sense  = [], [], [], [], []
-    bert_path = "FacebookAI/roberta-base" 
     tokenizer = AutoTokenizer.from_pretrained(bert_path)
-    assert not train or optimizer!=None
-    if train:
+    if mode == "train":
         model.train()
     else:
         model.eval()
 
     emotions_stat = torch.zeros(7, 7)
+    error_stats = {}
+    correct_count = []
 
-    with tqdm(total=int(len(dataloader) / args.accumulate_step), desc=f"Epoch {epoch+1}") as pbar:
-        for step, batch in enumerate(dataloader):
-            if train:
-                optimizer.zero_grad()
-            input_ids, label, label_mask, emotions, emo_mask, knowledge_ids, batch_split = batch
-            input_ids = input_ids.to(device)
-            label = label.to(device)
-            label_mask = label_mask.to(device)
-            emotions = emotions.to(device)
-            emo_mask = emo_mask.to(device)
-            knowledge_ids = knowledge_ids.to(device)
-            
-            if model.training:
-                if args.fp16:
-                    with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
+    for step, batch in enumerate(dataloader):
+        if mode == "train":
+            optimizer.zero_grad()
+        input_ids, label, label_mask, emotions, emo_mask, knowledge_ids, batch_split = batch
+        input_ids = input_ids.to(device)
+        label = label.to(device)
+        label_mask = label_mask.to(device)
+        emotions = emotions.to(device)
+        emo_mask = emo_mask.to(device)
+        knowledge_ids = knowledge_ids.to(device)
+        
+        if model.training:
+            if args.fp16:
+                with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
+                    log_prob, utt_mask = model(input_ids, emotions, emo_mask, knowledge_ids, batch_split, return_mask_output=True) 
+            else:
+                log_prob, utt_mask = model(input_ids, emotions, emo_mask, knowledge_ids, batch_split, return_mask_output=True) 
+        else:
+            if args.fp16:
+                with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
+                    with torch.no_grad():
                         log_prob, utt_mask = model(input_ids, emotions, emo_mask, knowledge_ids, batch_split, return_mask_output=True) 
-                else:
-                    log_prob, utt_mask = model(input_ids, emotions, emo_mask, knowledge_ids, batch_split, return_mask_output=True) 
             else:
-                if args.fp16:
-                    with torch.autocast(device_type="cuda" if args.cuda else "cpu"):
-                        with torch.no_grad():
-                            log_prob, utt_mask = model(input_ids, emotions, emo_mask, knowledge_ids, batch_split, return_mask_output=True) 
-                else:
-                    log_prob, utt_mask = model(input_ids, emotions, emo_mask, knowledge_ids, batch_split, return_mask_output=True) 
+                log_prob, utt_mask = model(input_ids, emotions, emo_mask, knowledge_ids, batch_split, return_mask_output=True) 
 
-            # BCE loss
-            label_mask = label_mask.eq(1)
-            utt_mask = utt_mask.eq(1)
-
-
-            lp_ = log_prob # [batch, seq_len]
-            labels_ = label # [batch, seq_len]
+        # BCE loss
+        label_mask = label_mask.eq(1)
+        utt_mask = utt_mask.eq(1)
+        emo_mask = emo_mask.eq(1).cpu()
+        lp_ = log_prob # [batch, seq_len]
+        labels_ = label # [batch, seq_len]
+        if mode == "train":
             loss = loss_function(labels_, lp_, label_mask, utt_mask, device)
-            if args.accumulate_step > 1:
-                loss = loss / args.accumulate_step
-            # log_prob = log_prob[utt_mask == 1]
-            log_prob = torch.masked_select(lp_, utt_mask)
-            labels_ = torch.masked_select(labels_.float(), label_mask)
-            
-           
+        else:
+            loss = torch.tensor([0])
+        if args.accumulate_step > 1:
+            loss = loss / args.accumulate_step
+        log_prob = torch.masked_select(lp_, utt_mask)
+        labels_ = torch.masked_select(labels_.float(), label_mask)
+        emos = torch.masked_select(emotions.cpu(), utt_mask)
+        if mode == "test":
+            input_ids_list = input_ids.tolist()
+            emos_check = emos.view(len(input_ids_list), -1)
+            pred_check = torch.gt(log_prob, 0.5).long().view(len(input_ids_list), -1)
+            labels_check = labels_.view(len(input_ids_list), -1)
+            for index, input_ids in enumerate(input_ids_list):
+                dialog = tokenizer.decode(input_ids, skip_special_tokens=True)
+                error = pred_check[index].cpu() != labels_check[index].cpu()
+                if len(emos) > 1:
+                    if emos[-1] != emos[-2]:
+                        if error[-2] == True:
+                            correct_count.append(0)
+                        else:
+                            correct_count.append(1)
+        lp_ = log_prob.view(-1)
+        labels_ = labels_.view(-1)
+        pred_ = torch.gt(lp_, 0.5).long() # batch*seq_len
+        preds.append(pred_.cpu().numpy())
+        labels.append(labels_.cpu().numpy())
+        masks.append(label_mask.view(-1).cpu().numpy())
+        losses.append(loss.item()*masks[-1].sum())
+        if mode == "train":
+            total_loss = loss
+            total_loss.backward()
+            if (step + 1) % args.accumulate_step == 0:
 
-            lp_ = log_prob.view(-1)
-            labels_ = labels_.view(-1)
-            
-            pred_ = torch.gt(lp_, 0.5).long() # batch*seq_len
-            
-            # print(pred_)
-
-            
-
-            preds.append(pred_.cpu().numpy())
-            labels.append(labels_.cpu().numpy())
-            masks.append(label_mask.view(-1).cpu().numpy())
-            losses.append(loss.item()*masks[-1].sum())
-            
-            if train:
-                total_loss = loss
-                total_loss.backward()
-                
-                if (step + 1) % args.accumulate_step == 0:
-                    pbar.update(1)
-                    optimizer.step()
-                step += 1
-            else:
-                pbar.update(1)
-
-            emos = torch.masked_select(emotions.cpu(), utt_mask)
-
-            end = emos[-1]
-
-            indices = pred_.eq(1).nonzero()
-
-            if sum(indices) == 0:
-                continue
-
-            starts = [emos[idx].item() for idx in indices]
-
-            for start in starts:
-                emotions_stat[start, end] += 1
-        # print("labels:", labels_)
-        # print("preds", pred_)
-    # print(emotions_stat)
+                optimizer.step()
+            step += 1
+        else:
+            pass
+        end = emos[-1]
+        indices = pred_.eq(1).nonzero()
+        if sum(indices) == 0:
+            continue
+        starts = [emos[idx].item() for idx in indices]
+        for start in starts:
+            emotions_stat[start, end] += 1
     if preds!=[]:
         preds  = np.concatenate(preds)
         labels = np.concatenate(labels)
@@ -219,15 +209,11 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, optimiz
     else:
         return float('nan'), float('nan'), float('nan'), [], [], [], float('nan'),[]
 
-    dialog = tokenizer.decode(input_ids, skip_special_tokens=True)
-    print("preds:", preds)
-    print("labels:", labels)
-    print("dialog_context:", dialog)
-
-
     avg_loss = round(np.sum(losses)/np.sum(masks), 4)
     avg_fscore = round(f1_score(labels, preds, average='macro')*100, 2)
-    if train == False:
+    if mode == "valid" or mode == "test":
+        if mode == "test":
+            print("correct_ratio:", sum(correct_count)/len(correct_count))
         reports = classification_report(labels,
                                         preds,
                                         target_names=['neg', 'pos'],
@@ -236,88 +222,6 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, device, optimiz
         return avg_loss, [avg_fscore], reports
     else:
         return avg_loss, [avg_fscore]
-
-def save_badcase(model, dataloader, cuda, args):
-    preds, labels = [], []
-    scores, vids = [], []
-    dialogs = []
-    speakers = []
-    conv_lens = []
-
-    model.eval()
-    dialog_id = 1
-    f_out = open('./badcase/badcase_dd.txt', 'w', encoding='utf-8')
-    print("Logging Badcase ...")
-    for data in tqdm(dataloader):
-
-        r1, r2, r3, r4, x1, x2, x3, x4, x5, x6, o1, o2, o3, \
-        qmask, umask, label, emotion_label, relative_position, \
-        intra_mask, inter_mask, attention_mask, token_ids, \
-        edge_index, edge_type, utterances, speaker, Ids = [data[i].cuda() if i<20 else data[i] for i in range(len(data))] if cuda else data
-        attention_mask = [t.cuda() for t in attention_mask]
-        token_ids = [t.cuda() for t in token_ids]
-
-        utterances = [u for u in utterances]
-        speaker = [s for s in speaker]
-
-        # print(speakers)
-        log_prob = model(token_ids, attention_mask, emotion_label, relative_position, edge_index, edge_type, intra_mask, inter_mask, r1, r2, r3, r4, x1, x2, x3, x4, x5, x6, o1, o2, o3, qmask, umask)
-        conv_len = torch.sum(umask != 0, dim=-1).cpu().numpy().tolist()
-        if model.training:
-            log_prob, masked_mapped_output, masked_outputs, proto_scores = model(input_ids, return_mask_output=True) 
-            loss_output = loss_function(log_prob, masked_mapped_output, label, mask, model)
-        else:
-            with torch.no_grad():
-                log_prob, masked_mapped_output, masked_outputs, proto_scores = model(input_ids, return_mask_output=True) 
-                loss_output = loss_function(log_prob, masked_mapped_output, label, mask, model)
-        # umask = umask.cpu().numpy().tolist()
-        label = label.cpu().numpy().tolist() # (B, N)
-        pred = torch.gt(log_prob.data, 0.5).long().cpu().numpy().tolist() # (B, N)
-        preds += pred
-        labels += label
-        dialogs += utterances
-        speakers += speaker
-        conv_len = [item for item in conv_len]
-        conv_lens += conv_len
-
-        # finished here
-
-    if preds != []:
-        new_preds = []
-        new_labels = []
-        for i,label in enumerate(labels):
-            for j in range(conv_lens[i]):
-                new_labels.append(label[j])
-                new_preds.append(preds[i][j])
-    else:
-        return
-
-    cases = []
-    for i,d in enumerate(dialogs):
-        case = []
-        for j,u in enumerate(d):
-            case.append({
-                'text': u,
-                'speaker': speakers[i][j],
-                'label': labels[i][j],
-                'pred': preds[i][j]
-            })
-            f_out.write(str(dialog_id) + '\t')
-            f_out.write(u + '\t')
-            f_out.write(speakers[i][j] + '\t')
-            f_out.write(str(labels[i][j]))
-            f_out.write('\t')
-            f_out.write(str(preds[i][j]) + '\n')
-        cases.append(case)
-        dialog_id += 1
-
-    with open('badcase/dailydialog.json', 'w', encoding='utf-8') as f:
-        json.dump(cases,f)
-
-    avg_accuracy = round(accuracy_score(new_labels, new_preds) * 100, 2)
-    avg_fscore = round(f1_score(new_labels, new_preds, average='macro') * 100, 2)
-    print('badcase saved')
-    print('test_f1', avg_fscore)
 
 if __name__ == '__main__':
 
@@ -340,25 +244,16 @@ if __name__ == '__main__':
     device = "cuda" if args.use_gpu else "cpu"
 
     fscore_list = []
-   
-    for seed in [0, 1, 2, 3]: # to reproduce results reported in the paper
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_path)
+    for seed in [1, 2, 3, 4]: # to reproduce results reported in the paper
         seed_everything(seed)
 
-        model = CLModel(args).to(device)
-        # print("model device", model.device)
-        # for n, p in model.named_parameters():
-        #     if p.requires_grad:
-        #         # print(n, p.size())
-        #         if len(p.shape) > 1:
-        #             torch.nn.init.xavier_uniform_(p)
-        #         else:
-        #             stdv = 1. / math.sqrt(p.shape[0])
-        #             torch.nn.init.uniform_(p, a=-stdv, b=stdv)
+        model = CLModel(args, tokenizer).to(device)
         print ('DailyDialog RECCON Model.')
 
         loss_function = MaskedBCELoss2()
-
-        train_loader, valid_loader, test_loader = get_DailyDialog_loaders(batch_size=batch_size, num_workers=0)
+        
+        train_loader, valid_loader, test_loader = get_DailyDialog_loaders(tokenizer=tokenizer, batch_size=batch_size, num_workers=0)
         
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
@@ -390,9 +285,9 @@ if __name__ == '__main__':
         for e in range(n_epochs):
             increase_flag = False
             start_time = time.time()
-            train_loss, train_fscore = train_or_eval_model(model, loss_function, train_loader, e, device, optimizer, True)
-            valid_loss, valid_fscore, valid_report = train_or_eval_model(model, loss_function, valid_loader,e ,device)
-            test_loss, test_fscore, test_report = train_or_eval_model(model, loss_function, test_loader, e, device)
+            train_loss, train_fscore = train_or_eval_model(model, loss_function, train_loader, e, device, args.bert_path, optimizer, mode="train")
+            valid_loss, valid_fscore, valid_report = train_or_eval_model(model, loss_function, valid_loader,e ,device, args.bert_path, mode="valid")
+            test_loss, test_fscore, test_report = train_or_eval_model(model, loss_function, test_loader, e, device, args.bert_path, mode="test")
             if valid_fscore[0] > max_valid_f1:
                 max_valid_f1 = valid_fscore[0]
                 best_model = model
