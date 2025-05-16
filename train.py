@@ -28,7 +28,7 @@ def get_parser():
     parser.add_argument('--no-cuda', action='store_true', default=False, help='does not use GPU')
     parser.add_argument('--lr', type=float, default=1e-5, metavar='LR', help='learning rate')
     parser.add_argument('--l2', type=float, default=0.0003, metavar='L2', help='L2 regularization weight')
-    parser.add_argument('--bert_path', type=str, default='./pretrained/roberta-base')
+    parser.add_argument('--bert_path', type=str, default='FacebookAI/roberta-base')
     parser.add_argument('--accumulate_step', type=int, required=False, default=1)
     parser.add_argument('--weight_decay', type=float, required=False, default=3e-4)
     parser.add_argument('--scheduler', type=str, required=False, default='constant')
@@ -94,7 +94,7 @@ def get_DailyDialog_loaders(batch_size=8, num_workers=0, pin_memory=False):
     # trainset = DailyDialogRobertaCometDataset('train')
     # validset = DailyDialogRobertaCometDataset('valid')
     # testset = DailyDialogRobertaCometDataset('test')
-    bert_path = "./pretrained/roberta-" + args.model_size
+    bert_path = "FacebookAI/roberta-base"
     tokenizer = AutoTokenizer.from_pretrained(bert_path)
     trainset = DailyDialogRobertaDataset('train', tokenizer)
     validset = DailyDialogRobertaDataset('valid', tokenizer)
@@ -119,7 +119,7 @@ def get_DailyDialog_loaders(batch_size=8, num_workers=0, pin_memory=False):
 
 def train_or_eval_model(model, loss_function, dataloader, epoch, device, optimizer=None, train=False):
     losses, preds, labels, masks, losses_sense  = [], [], [], [], []
-    bert_path = "./pretrained/roberta-base" 
+    bert_path = "FacebookAI/roberta-base" 
     tokenizer = AutoTokenizer.from_pretrained(bert_path)
     assert not train or optimizer!=None
     if train:
